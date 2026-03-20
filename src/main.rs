@@ -1,11 +1,15 @@
 use rocket::{get, launch, routes};
 
+use crate::utils::response::ApiResponse;
+mod guards;
+mod utils;
+
 #[get("/")]
-fn index() -> &'static str {
-    "Hello, world!"
+fn index() -> ApiResponse<&'static str> {
+    ApiResponse::success("Hello World", "Welcome to api")
 }
 
 #[launch]
-fn rocker() -> _ {
+fn rocket() -> _ {
     rocket::build().mount("/", routes![index])
 }
