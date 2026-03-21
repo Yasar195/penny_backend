@@ -1,8 +1,8 @@
 use rocket::http::{ContentType, Status};
 use rocket::request::Request;
 use rocket::response::{self, Responder, Response};
-use rocket::serde::json::serde_json;
 use rocket::serde::Serialize;
+use rocket::serde::json::serde_json;
 use std::io::Cursor;
 
 #[derive(Serialize)]
@@ -18,7 +18,7 @@ pub struct ApiResponse<T: Serialize> {
 impl<'r, T: Serialize> Responder<'r, 'static> for ApiResponse<T> {
     fn respond_to(self, _: &'r Request<'_>) -> response::Result<'static> {
         let body = serde_json::to_string(&self).map_err(|_| Status::InternalServerError)?;
- 
+
         Response::build()
             .status(Status::new(self.status))
             .header(ContentType::JSON)
@@ -37,7 +37,7 @@ impl<T: Serialize> ApiResponse<T> {
             data: Some(data),
         }
     }
- 
+
     pub fn created(data: T, message: impl Into<String>) -> Self {
         Self {
             success: true,
@@ -47,8 +47,12 @@ impl<T: Serialize> ApiResponse<T> {
             data: Some(data),
         }
     }
- 
-    pub fn error(status: u16, message: impl Into<String>, error: impl Into<String>) -> ApiResponse<T> {
+
+    pub fn error(
+        status: u16,
+        message: impl Into<String>,
+        error: impl Into<String>,
+    ) -> ApiResponse<T> {
         ApiResponse {
             success: false,
             status,
@@ -57,20 +61,24 @@ impl<T: Serialize> ApiResponse<T> {
             data: None,
         }
     }
- 
+
     pub fn not_found(message: impl Into<String>) -> ApiResponse<T> {
         Self::error(404, message, "Not Found")
     }
- 
+
     pub fn unauthorized(message: impl Into<String>) -> ApiResponse<T> {
         Self::error(401, message, "Unauthorized")
     }
- 
+
     pub fn bad_request(message: impl Into<String>) -> ApiResponse<T> {
         Self::error(400, message, "Bad Request")
     }
- 
+
     pub fn internal_error(message: impl Into<String>) -> ApiResponse<T> {
         Self::error(500, message, "Internal Server Error")
+    }
+
+    pub fn malformed_error(message: impl Into<String>) -> ApiResponse<T> {
+        Self::error(422, message, "Malformed Request")
     }
 }
