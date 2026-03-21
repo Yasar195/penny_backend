@@ -2,7 +2,12 @@ use rocket;
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome, Request};
 
-pub struct Auth(pub String);
+use crate::utils::jwt::verify_access_token;
+
+pub struct Auth {
+    pub user_id: i64,
+    pub phone: String,
+}
 
 #[derive(Debug)]
 pub enum AuthError {
@@ -15,14 +20,20 @@ impl<'r> FromRequest<'r> for Auth {
     type Error = AuthError;
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        match request.headers().get_one("X-Api-Key") {
-            Some(key) if is_valid(key) => Outcome::Success(Auth(key.to_string())),
-            Some(_) => Outcome::Error((Status::Unauthorized, AuthError::Invalid)),
-            None => Outcome::Error((Status::Unauthorized, AuthError::Missing)),
+        let Some(authorization) = request.headers().get_one("Authorization") else {
+            return Outcome::Error((Status::Unauthorized, AuthError::Missing));
+        };
+
+        let Some(token) = authorization.strip_prefix("Bearer ") else {
+            return Outcome::Error((Status::Unauthorized, AuthError::Invalid));
+        };
+
+        match verify_access_token(token.trim()) {
+            Ok(user) => Outcome::Success(Auth {
+                user_id: user.user_id,
+                phone: user.phone,
+            }),
+            Err(_) => Outcome::Error((Status::Unauthorized, AuthError::Invalid)),
         }
     }
-}
-
-fn is_valid(key: &str) -> bool {
-    key == "secret_api_key"
 }

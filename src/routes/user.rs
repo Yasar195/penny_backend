@@ -3,7 +3,9 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QuerySele
 
 use crate::db::postgres::PostgresPool;
 use crate::entities::users;
+use crate::guards::auth::Auth;
 use crate::routes::pagination::Pagination;
+use crate::utils::jwt::{TokenPair, generate_auth_tokens};
 use crate::utils::response::ApiResponse;
 
 #[derive(Debug, Deserialize)]
@@ -20,6 +22,12 @@ pub struct UpdateUserRequest {
     pub phone: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(crate = "rocket::serde")]
+pub struct LoginRequest {
+    pub phone: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(crate = "rocket::serde")]
 pub struct DeleteUserResponse {
@@ -27,7 +35,9 @@ pub struct DeleteUserResponse {
 }
 
 #[rocket::post("/users", data = "<payload>")]
-pub async fn create_user(payload: Json<CreateUserRequest>) -> ApiResponse<users::Model> {
+pub async fn create_user(
+    payload: Json<CreateUserRequest>,
+) -> ApiResponse<users::Model> {
     let name = payload.name.trim();
     let phone = payload.phone.trim();
 
@@ -55,7 +65,9 @@ pub async fn create_user(payload: Json<CreateUserRequest>) -> ApiResponse<users:
 }
 
 #[rocket::get("/users?<pagination..>")]
-pub async fn list_users(pagination: Pagination) -> ApiResponse<Vec<users::Model>> {
+pub async fn list_users(auth: Auth, pagination: Pagination) -> ApiResponse<Vec<users::Model>> {
+    let _ = auth;
+
     let db = match PostgresPool::connection().await {
         Ok(connection) => connection,
         Err(error) => {
@@ -71,6 +83,36 @@ pub async fn list_users(pagination: Pagination) -> ApiResponse<Vec<users::Model>
     {
         Ok(user_list) => ApiResponse::success(user_list, "Users fetched successfully"),
         Err(error) => ApiResponse::internal_error(format!("Failed to fetch users: {error}")),
+    }
+}
+
+#[rocket::post("/login", data = "<payload>")]
+pub async fn login(payload: Json<LoginRequest>) -> ApiResponse<TokenPair> {
+    let phone = payload.phone.trim();
+    if phone.is_empty() {
+        return ApiResponse::bad_request("phone is required");
+    }
+
+    let db = match PostgresPool::connection().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ApiResponse::internal_error(format!("Database connection error: {error}"));
+        }
+    };
+
+    let user = match users::Entity::find()
+        .filter(users::Column::Phone.eq(phone))
+        .one(db)
+        .await
+    {
+        Ok(Some(user)) => user,
+        Ok(None) => return ApiResponse::unauthorized("Invalid phone number"),
+        Err(error) => return ApiResponse::internal_error(format!("Failed to login: {error}")),
+    };
+
+    match generate_auth_tokens(user.id, &user.phone) {
+        Ok(tokens) => ApiResponse::success(tokens, "Login successful"),
+        Err(error) => ApiResponse::internal_error(format!("Failed to login: {error}")),
     }
 }
 
@@ -173,7 +215,14 @@ pub async fn delete_user(id: i64) -> ApiResponse<DeleteUserResponse> {
 }
 
 pub fn routes() -> Vec<rocket::Route> {
-    rocket::routes![create_user, list_users, get_user, update_user, delete_user]
+    rocket::routes![
+        create_user,
+        list_users,
+        login,
+        get_user,
+        update_user,
+        delete_user
+    ]
 }
 
 fn validate_user_payload(name: &str, phone: &str) -> Option<String> {

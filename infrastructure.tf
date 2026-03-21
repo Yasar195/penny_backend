@@ -6,10 +6,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    null = {
-      source  = "hashicorp/null"
-      version = "~> 3.2"
-    }
   }
 }
 
@@ -196,30 +192,6 @@ resource "aws_cloudwatch_log_group" "lambda" {
   tags              = local.tags
 }
 
-resource "null_resource" "build_and_push_image" {
-  triggers = {
-    image_uri       = local.image_uri
-    dockerfile_hash = filesha256("${path.module}/Dockerfile")
-    cargo_toml_hash = filesha256("${path.module}/Cargo.toml")
-    cargo_lock_hash = filesha256("${path.module}/Cargo.lock")
-    src_hash = sha256(join(
-      "",
-      [for file in sort(fileset(path.module, "src/**")) : filesha256("${path.module}/${file}")]
-    ))
-  }
-
-  depends_on = [aws_ecr_repository.app]
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-lc"]
-    command     = <<-EOT
-      set -euo pipefail
-      aws ecr get-login-password --region '${var.aws_region}' | docker login --username AWS --password-stdin '${local.ecr_registry}'
-      docker buildx build --platform '${var.docker_platform}' -t '${local.image_uri}' --push .
-    EOT
-  }
-}
-
 resource "aws_lambda_function" "app" {
   function_name = var.lambda_function_name
   role          = aws_iam_role.lambda_exec.arn
@@ -241,7 +213,6 @@ resource "aws_lambda_function" "app" {
   }
 
   depends_on = [
-    null_resource.build_and_push_image,
     aws_iam_role_policy_attachment.lambda_basic_execution,
     aws_cloudwatch_log_group.lambda
   ]

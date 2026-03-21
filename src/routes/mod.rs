@@ -17,7 +17,10 @@ fn index(pagination: Pagination) -> ApiResponse<&'static str> {
 fn protected_route(auth: Auth, pagination: Pagination) -> ApiResponse<String> {
     let _ = pagination;
     ApiResponse::success(
-        format!("this is protected data {}", auth.0),
+        format!(
+            "this is protected data for user_id={} phone={}",
+            auth.user_id, auth.phone
+        ),
         "Access granted".to_string(),
     )
 }
