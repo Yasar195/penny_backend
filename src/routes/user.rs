@@ -5,6 +5,7 @@ use crate::db::postgres::PostgresPool;
 use crate::entities::users;
 use crate::guards::auth::Auth;
 use crate::routes::pagination::Pagination;
+use crate::utils::firebase::{FirebaseAuthError, verify_firebase_id_token};
 use crate::utils::jwt::{TokenPair, generate_auth_tokens};
 use crate::utils::response::ApiResponse;
 
@@ -25,7 +26,7 @@ pub struct UpdateUserRequest {
 #[derive(Debug, Deserialize)]
 #[serde(crate = "rocket::serde")]
 pub struct LoginRequest {
-    pub phone: String,
+    pub token: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,10 +35,15 @@ pub struct DeleteUserResponse {
     pub id: i64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(crate = "rocket::serde")]
+pub struct UserResponse {
+    pub id: i64,
+    pub name: String,
+}
+
 #[rocket::post("/users", data = "<payload>")]
-pub async fn create_user(
-    payload: Json<CreateUserRequest>,
-) -> ApiResponse<users::Model> {
+pub async fn create_user(payload: Json<CreateUserRequest>) -> ApiResponse<UserResponse> {
     let name = payload.name.trim();
     let phone = payload.phone.trim();
 
@@ -59,13 +65,15 @@ pub async fn create_user(
     };
 
     match user.insert(db).await {
-        Ok(created_user) => ApiResponse::created(created_user, "User created successfully"),
+        Ok(created_user) => {
+            ApiResponse::created(to_user_response(created_user), "User created successfully")
+        }
         Err(error) => map_db_error(error, "Failed to create user"),
     }
 }
 
 #[rocket::get("/users?<pagination..>")]
-pub async fn list_users(auth: Auth, pagination: Pagination) -> ApiResponse<Vec<users::Model>> {
+pub async fn list_users(auth: Auth, pagination: Pagination) -> ApiResponse<Vec<UserResponse>> {
     let _ = auth;
 
     let db = match PostgresPool::connection().await {
@@ -81,16 +89,33 @@ pub async fn list_users(auth: Auth, pagination: Pagination) -> ApiResponse<Vec<u
         .all(db)
         .await
     {
-        Ok(user_list) => ApiResponse::success(user_list, "Users fetched successfully"),
+        Ok(user_list) => ApiResponse::success(
+            user_list.into_iter().map(to_user_response).collect(),
+            "Users fetched successfully",
+        ),
         Err(error) => ApiResponse::internal_error(format!("Failed to fetch users: {error}")),
     }
 }
 
 #[rocket::post("/login", data = "<payload>")]
 pub async fn login(payload: Json<LoginRequest>) -> ApiResponse<TokenPair> {
-    let phone = payload.phone.trim();
-    if phone.is_empty() {
-        return ApiResponse::bad_request("phone is required");
+    let firebase_token = payload.token.trim();
+    if firebase_token.is_empty() {
+        return ApiResponse::bad_request("token is required");
+    }
+
+    let firebase_user = match verify_firebase_id_token(firebase_token).await {
+        Ok(user) => user,
+        Err(FirebaseAuthError::InvalidToken(error)) => {
+            return ApiResponse::unauthorized(format!("Invalid Firebase token: {error}"));
+        }
+        Err(FirebaseAuthError::Service(error)) => {
+            return ApiResponse::internal_error(format!("Firebase verification failed: {error}"));
+        }
+    };
+
+    if firebase_user.phone.len() > 15 {
+        return ApiResponse::bad_request("phone must be at most 15 characters");
     }
 
     let db = match PostgresPool::connection().await {
@@ -101,12 +126,47 @@ pub async fn login(payload: Json<LoginRequest>) -> ApiResponse<TokenPair> {
     };
 
     let user = match users::Entity::find()
-        .filter(users::Column::Phone.eq(phone))
+        .filter(users::Column::Phone.eq(firebase_user.phone.clone()))
         .one(db)
         .await
     {
         Ok(Some(user)) => user,
-        Ok(None) => return ApiResponse::unauthorized("Invalid phone number"),
+        Ok(None) => {
+            let name = resolved_user_name(firebase_user.name.as_deref());
+            let new_user = users::ActiveModel {
+                name: Set(name),
+                phone: Set(firebase_user.phone.clone()),
+                ..Default::default()
+            };
+
+            match new_user.insert(db).await {
+                Ok(created_user) => created_user,
+                Err(error) if is_duplicate_phone_error(&error) => {
+                    match users::Entity::find()
+                        .filter(users::Column::Phone.eq(firebase_user.phone.clone()))
+                        .one(db)
+                        .await
+                    {
+                        Ok(Some(existing_user)) => existing_user,
+                        Ok(None) => {
+                            return ApiResponse::internal_error(
+                                "Failed to resolve user after duplicate phone insert",
+                            );
+                        }
+                        Err(fetch_error) => {
+                            return ApiResponse::internal_error(format!(
+                                "Failed to fetch user after duplicate phone insert: {fetch_error}"
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return ApiResponse::internal_error(format!(
+                        "Failed to create user during login: {error}"
+                    ));
+                }
+            }
+        }
         Err(error) => return ApiResponse::internal_error(format!("Failed to login: {error}")),
     };
 
@@ -117,7 +177,7 @@ pub async fn login(payload: Json<LoginRequest>) -> ApiResponse<TokenPair> {
 }
 
 #[rocket::get("/users/<id>?<pagination..>")]
-pub async fn get_user(id: i64, pagination: Pagination) -> ApiResponse<users::Model> {
+pub async fn get_user(id: i64, pagination: Pagination) -> ApiResponse<UserResponse> {
     let _ = pagination;
 
     let db = match PostgresPool::connection().await {
@@ -128,14 +188,14 @@ pub async fn get_user(id: i64, pagination: Pagination) -> ApiResponse<users::Mod
     };
 
     match users::Entity::find_by_id(id).one(db).await {
-        Ok(Some(user)) => ApiResponse::success(user, "User fetched successfully"),
+        Ok(Some(user)) => ApiResponse::success(to_user_response(user), "User fetched successfully"),
         Ok(None) => ApiResponse::not_found("User not found"),
         Err(error) => ApiResponse::internal_error(format!("Failed to fetch user: {error}")),
     }
 }
 
 #[rocket::put("/users/<id>", data = "<payload>")]
-pub async fn update_user(id: i64, payload: Json<UpdateUserRequest>) -> ApiResponse<users::Model> {
+pub async fn update_user(id: i64, payload: Json<UpdateUserRequest>) -> ApiResponse<UserResponse> {
     let db = match PostgresPool::connection().await {
         Ok(connection) => connection,
         Err(error) => {
@@ -179,7 +239,9 @@ pub async fn update_user(id: i64, payload: Json<UpdateUserRequest>) -> ApiRespon
     }
 
     match user.update(db).await {
-        Ok(updated_user) => ApiResponse::success(updated_user, "User updated successfully"),
+        Ok(updated_user) => {
+            ApiResponse::success(to_user_response(updated_user), "User updated successfully")
+        }
         Err(error) => map_db_error(error, "Failed to update user"),
     }
 }
@@ -250,4 +312,32 @@ fn map_db_error<T: Serialize>(error: sea_orm::DbErr, fallback_message: &str) -> 
     }
 
     ApiResponse::internal_error(format!("{fallback_message}: {message}"))
+}
+
+fn to_user_response(user: users::Model) -> UserResponse {
+    UserResponse {
+        id: user.id,
+        name: user.name,
+    }
+}
+
+fn resolved_user_name(firebase_name: Option<&str>) -> String {
+    const MAX_USER_NAME_LENGTH: usize = 100;
+    const DEFAULT_NAME: &str = "User";
+
+    let Some(name) = firebase_name else {
+        return DEFAULT_NAME.to_string();
+    };
+
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_NAME.to_string();
+    }
+
+    trimmed.chars().take(MAX_USER_NAME_LENGTH).collect()
+}
+
+fn is_duplicate_phone_error(error: &sea_orm::DbErr) -> bool {
+    let message = error.to_string();
+    message.contains("duplicate key value") || message.contains("users_phone_key")
 }
